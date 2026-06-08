@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local build/dependency workspace. The generated sample outputs are kept
+# outside this directory so they can be committed when desired.
+openabm_work/
+
+# Local optimization outputs from smoke tests.
+results/
+
+# OpenABM raw outputs and full converted source CSVs are large. Keep the small
+# extracted samples under openabm_sample_outputs/**/samples/ commit-ready.
+openabm_sample_outputs/**/raw_openabm/
+openabm_sample_outputs/**/population_all.csv
+openabm_sample_outputs/**/contacts_all.csv
+
+# Synthetic smoke-test data from run_poolsize_experiment.py.
+company_openabm_outputs/
+
+# Small OpenABM smoke-test samples; keep standard n3000 samples commit-ready.
+openabm_sample_outputs/**/samples/company_n300_maxpos5pct_work/
