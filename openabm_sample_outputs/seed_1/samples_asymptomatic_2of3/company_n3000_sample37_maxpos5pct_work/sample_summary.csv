@@ -1,0 +1,2 @@
+n,positive_count,positive_rate,contact_edges,weighted_graph_edges,positive_positive_edges,positive_symptomatic_count,positive_symptomatic_rate,asymptomatic_positive_count,asymptomatic_positive_rate,negative_symptomatic_count,negative_symptomatic_rate,mean_symptom_count_positive,mean_symptom_count_negative
+3000,52,0.017333333333333333,10897,6255,72,23,0.4423076923076923,29,0.5576923076923077,371,0.12584803256445048,0.8076923076923077,0.1451831750339213

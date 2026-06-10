@@ -16,9 +16,9 @@ import subprocess
 import numpy as np
 import pandas as pd
 
-SYMPTOM_NAMES = ["item0", "item1", "item2"]
+SYMPTOM_NAMES = ["fever", "cough", "sore_throat", "headache", "runny_nose", "fatigue"]
 COVID_SYMPTOM_INDICES = [0, 1, 2]
-NONCOVID_SYMPTOM_INDICES = []
+NONCOVID_SYMPTOM_INDICES = [3, 4, 5]
 
 
 DEFAULT_CONTACT_TYPE_WEIGHTS = {

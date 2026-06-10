@@ -1,0 +1,4 @@
+symptom_graph_group,positive_count,asymptomatic_positive_count,mean_graph_symptom_sum,mean_combined_score,positive_share,asymptomatic_share_within_group
+A,22,0,25.636363636363637,4.598484848484848,0.4074074074074074,0.0
+C,31,31,35.87096774193548,5.978494623655914,0.5740740740740741,1.0
+D,1,1,0.0,0.0,0.018518518518518517,1.0

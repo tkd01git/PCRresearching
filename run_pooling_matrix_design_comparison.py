@@ -158,6 +158,7 @@ def evaluate_sparse(full_dataset: dict, args: argparse.Namespace, sample_id: int
         individual_tests = 0
         total_tests = initial_pool_tests
         true_positive_rank = 0
+        detected_positive_count = 0
     else:
         priors, _, _ = ds.compute_prior_methods(
             analysis_dataset,
@@ -175,6 +176,9 @@ def evaluate_sparse(full_dataset: dict, args: argparse.Namespace, sample_id: int
         individual_tests = int(res["inspection_count"])
         total_tests = int(res["total_test_cost"])
         true_positive_rank = true_positive_rank_from_measurements(res, fallback=individual_tests)
+        detected_positive_count = int(res.get("detected_count", 0))
+    false_negative = max(0, true_positive_count - detected_positive_count)
+    false_positive = max(0, individual_tests - detected_positive_count)
     return {
         "sample_id": int(sample_id),
         "pool_size": int(pool_size),
@@ -183,6 +187,9 @@ def evaluate_sparse(full_dataset: dict, args: argparse.Namespace, sample_id: int
         "initial_pool_tests": int(initial_pool_tests),
         "candidate_count": int(candidate_count),
         "individual_tests": int(individual_tests),
+        "detected_positive_count": int(detected_positive_count),
+        "false_negative": int(false_negative),
+        "false_positive": int(false_positive),
         "true_positive_rank": int(true_positive_rank),
         "number_of_positive_pools": stats["number_of_positive_pools"],
         "candidate_positive_rate": float(candidate_positive_rate),

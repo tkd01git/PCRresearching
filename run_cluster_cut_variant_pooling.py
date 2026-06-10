@@ -18,6 +18,7 @@ import function_poolsizefittiing as fn
 from run_cluster_pooling_design_experiment import (
     make_cluster_cut_balanced_pools,
     pool_structure_metrics,
+    pools_to_matrix,
 )
 from run_openabm_poolsize_sweep import sample_dirs
 from run_pooling_matrix_design_comparison import (
@@ -35,14 +36,134 @@ def method_name_for_cap(cap: int) -> str:
     return f"cluster_cut_softcap_{int(cap)}_weighted_sparse_reconstruction"
 
 
+METHOD_SYMPTOM_GRAPH_STRATIFIED = "symptom_graph_stratified_A_weighted_sparse_reconstruction"
+
+
+def symptom_graph_personal_blocked_method_name(risk_pool_count: int) -> str:
+    return f"symptom_graph_personal_blocked_riskpools_{int(risk_pool_count)}_A_weighted_sparse_reconstruction"
+
+
+def symptom_graph_groups(symptom_count: np.ndarray, W: np.ndarray) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Group people by own symptoms and graph-derived symptom exposure."""
+    s = np.asarray(symptom_count, dtype=float)
+    W_arr = np.asarray(W, dtype=float)
+    g = W_arr @ s
+    groups = {
+        "A": np.where((s > 0) & (g > 0))[0].astype(int),
+        "B": np.where((s > 0) & (g == 0))[0].astype(int),
+        "C": np.where((s == 0) & (g > 0))[0].astype(int),
+        "D": np.where((s == 0) & (g == 0))[0].astype(int),
+    }
+    return groups, g
+
+
+def make_symptom_graph_stratified_pools(
+    W: np.ndarray,
+    symptom_count: np.ndarray,
+    pool_size: int,
+    seed: int,
+) -> tuple[np.ndarray, list[tuple[int, ...]], dict[str, int]]:
+    n = len(symptom_count)
+    pool_count = int(np.ceil(n / int(pool_size)))
+    pools: list[list[int]] = [[] for _ in range(pool_count)]
+    groups, _ = symptom_graph_groups(symptom_count, W)
+    rng = np.random.default_rng(int(seed))
+
+    cursor = 0
+    for label in ["A", "B", "C", "D"]:
+        members = groups[label].copy()
+        rng.shuffle(members)
+        for person in members.astype(int).tolist():
+            placed = False
+            for offset in range(pool_count):
+                pool_idx = (cursor + offset) % pool_count
+                if len(pools[pool_idx]) < int(pool_size):
+                    pools[pool_idx].append(int(person))
+                    cursor = (pool_idx + 1) % pool_count
+                    placed = True
+                    break
+            if not placed:
+                raise RuntimeError("No pool with remaining capacity")
+
+    A, pool_tuples = pools_to_matrix(pools, n)
+    group_counts = {f"group_{label}_count": int(len(groups[label])) for label in ["A", "B", "C", "D"]}
+    return A, pool_tuples, group_counts
+
+
+def place_round_robin(
+    pools: list[list[int]],
+    people: np.ndarray,
+    allowed_pool_indices: list[int],
+    pool_size: int,
+    cursor: int,
+) -> int:
+    if not allowed_pool_indices:
+        raise ValueError("allowed_pool_indices must not be empty")
+    for person in people.astype(int).tolist():
+        placed = False
+        for offset in range(len(allowed_pool_indices)):
+            pos = (cursor + offset) % len(allowed_pool_indices)
+            pool_idx = int(allowed_pool_indices[pos])
+            if len(pools[pool_idx]) < int(pool_size):
+                pools[pool_idx].append(int(person))
+                cursor = (pos + 1) % len(allowed_pool_indices)
+                placed = True
+                break
+        if not placed:
+            raise RuntimeError("No pool with remaining capacity among allowed pools")
+    return cursor
+
+
+def make_symptom_graph_personal_blocked_pools(
+    W: np.ndarray,
+    symptom_count: np.ndarray,
+    pool_size: int,
+    risk_pool_count: int,
+    seed: int,
+) -> tuple[np.ndarray, list[tuple[int, ...]], dict[str, int]]:
+    n = len(symptom_count)
+    pool_count = int(np.ceil(n / int(pool_size)))
+    pools: list[list[int]] = [[] for _ in range(pool_count)]
+    groups, _ = symptom_graph_groups(symptom_count, W)
+    rng = np.random.default_rng(int(seed))
+
+    personal_count = int(len(groups["A"]) + len(groups["B"]))
+    min_risk_pool_count = int(np.ceil(personal_count / max(int(pool_size), 1)))
+    effective_risk_pool_count = min(pool_count, max(int(risk_pool_count), min_risk_pool_count, 1))
+    risk_pool_indices = list(range(effective_risk_pool_count))
+    all_pool_indices = list(range(pool_count))
+
+    risk_cursor = 0
+    for label in ["A", "B"]:
+        members = groups[label].copy()
+        rng.shuffle(members)
+        risk_cursor = place_round_robin(pools, members, risk_pool_indices, pool_size, risk_cursor)
+
+    all_cursor = 0
+    for label in ["C", "D"]:
+        members = groups[label].copy()
+        rng.shuffle(members)
+        all_cursor = place_round_robin(pools, members, all_pool_indices, pool_size, all_cursor)
+
+    A, pool_tuples = pools_to_matrix(pools, n)
+    group_counts = {f"group_{label}_count": int(len(groups[label])) for label in ["A", "B", "C", "D"]}
+    group_counts["risk_pool_count"] = int(effective_risk_pool_count)
+    return A, pool_tuples, group_counts
+
+
 def run_experiment(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     args.results_dir.mkdir(parents=True, exist_ok=True)
     result_csv = args.results_dir / "cluster_cut_variant_results.csv"
     structure_csv = args.results_dir / "cluster_cut_variant_structure.csv"
+    if not args.resume:
+        for path in [result_csv, structure_csv]:
+            if path.exists():
+                path.unlink()
     existing = pd.read_csv(result_csv) if args.resume and result_csv.exists() else pd.DataFrame()
     existing_structure = pd.read_csv(structure_csv) if args.resume and structure_csv.exists() else pd.DataFrame()
     dirs = sample_dirs(args.samples_root, parse_int_list(args.sample_indices))
     caps = parse_int_list(args.same_cluster_soft_caps)
+    personal_blocked_risk_pool_counts = parse_int_list(args.symptom_graph_personal_blocked_risk_pool_counts)
 
     for sample_dir in dirs:
         sample_id = int(sample_dir.name.split("_sample", 1)[1].split("_", 1)[0])
@@ -81,12 +202,53 @@ def run_experiment(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
         pool_dataset_base["params"] = params
 
         random_seed = int(args.random_seed_base + sample_id * 1000 + int(args.pool_size))
+        empty_group_counts = {f"group_{label}_count": np.nan for label in ["A", "B", "C", "D"]}
+        empty_group_counts["risk_pool_count"] = np.nan
         if not (args.resume and result_exists(existing, sample_id, int(args.pool_size), METHOD_RANDOM_SPARSE)):
             random_A, random_pools = make_random_pools(len(population), int(args.pool_size), random_seed)
             random_dataset = with_pooling(pool_dataset_base, random_A, random_pools, "random")
             row = evaluate_sparse(random_dataset, args, sample_id, int(args.pool_size), METHOD_RANDOM_SPARSE)
             row["variant"] = "random"
             row["same_cluster_soft_cap"] = np.nan
+            row.update(empty_group_counts)
+            append_row(result_csv, row)
+
+        if not (args.resume and result_exists(existing, sample_id, int(args.pool_size), METHOD_SYMPTOM_GRAPH_STRATIFIED)):
+            strat_A, strat_pools, group_counts = make_symptom_graph_stratified_pools(
+                W,
+                symptom_count,
+                int(args.pool_size),
+                seed=random_seed + 17,
+            )
+            strat_dataset = with_pooling(pool_dataset_base, strat_A, strat_pools, "symptom_graph_stratified")
+            row = evaluate_sparse(strat_dataset, args, sample_id, int(args.pool_size), METHOD_SYMPTOM_GRAPH_STRATIFIED)
+            row["variant"] = "symptom_graph_stratified"
+            row["same_cluster_soft_cap"] = np.nan
+            row.update(group_counts)
+            row["risk_pool_count"] = np.nan
+            append_row(result_csv, row)
+
+        for risk_pool_count in personal_blocked_risk_pool_counts:
+            personal_method = symptom_graph_personal_blocked_method_name(risk_pool_count)
+            if args.resume and result_exists(existing, sample_id, int(args.pool_size), personal_method):
+                continue
+            personal_A, personal_pools, group_counts = make_symptom_graph_personal_blocked_pools(
+                W,
+                symptom_count,
+                int(args.pool_size),
+                int(risk_pool_count),
+                seed=random_seed + 47 + int(risk_pool_count),
+            )
+            personal_dataset = with_pooling(
+                pool_dataset_base,
+                personal_A,
+                personal_pools,
+                f"symptom_graph_personal_blocked_riskpools_{int(risk_pool_count)}",
+            )
+            row = evaluate_sparse(personal_dataset, args, sample_id, int(args.pool_size), personal_method)
+            row["variant"] = f"symptom_graph_personal_blocked_{int(risk_pool_count)}"
+            row["same_cluster_soft_cap"] = np.nan
+            row.update(group_counts)
             append_row(result_csv, row)
 
         for cap in caps:
@@ -105,6 +267,7 @@ def run_experiment(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
             row = evaluate_sparse(dataset, args, sample_id, int(args.pool_size), method)
             row["variant"] = f"softcap_{int(cap)}"
             row["same_cluster_soft_cap"] = int(cap)
+            row.update(empty_group_counts)
             append_row(result_csv, row)
 
             if not (
@@ -133,7 +296,22 @@ def run_experiment(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
 
 
 def summarize(results: pd.DataFrame, structure: pd.DataFrame, results_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    for col in ["sample_id", "pool_size", "total_tests", "candidate_count", "individual_tests", "true_positive_rank"]:
+    for col in [
+        "sample_id",
+        "pool_size",
+        "total_tests",
+        "candidate_count",
+        "individual_tests",
+        "detected_positive_count",
+        "false_negative",
+        "false_positive",
+        "true_positive_rank",
+        "group_A_count",
+        "group_B_count",
+        "group_C_count",
+        "group_D_count",
+        "risk_pool_count",
+    ]:
         if col in results.columns:
             results[col] = pd.to_numeric(results[col])
     summary = (
@@ -145,7 +323,14 @@ def summarize(results: pd.DataFrame, structure: pd.DataFrame, results_dir: Path)
             std_total_tests=("total_tests", "std"),
             mean_candidate_count=("candidate_count", "mean"),
             mean_individual_tests=("individual_tests", "mean"),
+            mean_false_negative=("false_negative", "mean"),
+            mean_false_positive=("false_positive", "mean"),
             mean_true_positive_rank=("true_positive_rank", "mean"),
+            mean_group_A_count=("group_A_count", "mean"),
+            mean_group_B_count=("group_B_count", "mean"),
+            mean_group_C_count=("group_C_count", "mean"),
+            mean_group_D_count=("group_D_count", "mean"),
+            mean_risk_pool_count=("risk_pool_count", "mean"),
         )
         .sort_values(["mean_total_tests", "variant"])
     )
@@ -176,7 +361,16 @@ def summarize(results: pd.DataFrame, structure: pd.DataFrame, results_dir: Path)
 
 def print_summary(summary: pd.DataFrame, comparison: pd.DataFrame) -> None:
     print("\nSummary by variant:")
-    print(summary[["variant", "n_samples", "mean_total_tests", "median_total_tests", "mean_individual_tests", "mean_candidate_count"]].to_string(index=False))
+    print(summary[[
+        "variant",
+        "n_samples",
+        "mean_total_tests",
+        "median_total_tests",
+        "mean_individual_tests",
+        "mean_candidate_count",
+        "mean_false_negative",
+        "mean_false_positive",
+    ]].to_string(index=False))
     print("\nProposed variants vs random:")
     print(comparison.to_string(index=False))
 
@@ -187,6 +381,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-indices", nargs="+", default=["1:50"])
     p.add_argument("--pool-size", type=int, default=80)
     p.add_argument("--same-cluster-soft-caps", nargs="+", default=["1", "2", "3", "5", "8"])
+    p.add_argument("--symptom-graph-personal-blocked-risk-pool-counts", nargs="+", default=[])
     p.add_argument("--results-dir", type=Path, default=Path("results/cluster_cut_variant_pooling"))
     p.add_argument("--method", default="symptom_count_plus_graph")
     p.add_argument("--resume", action="store_true", default=True)
