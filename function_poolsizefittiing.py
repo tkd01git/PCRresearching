@@ -51,7 +51,13 @@ def derive_params(params: dict) -> dict:
     return out
 
 
-def make_pooling_matrix(n: int, pool_size: int = 10, gaps: tuple = (1,), allow_incomplete_last_pool: bool = True):
+def make_pooling_matrix(
+    n: int,
+    pool_size: int = 10,
+    gaps: tuple = (1,),
+    allow_incomplete_last_pool: bool = True,
+    pool_order=None,
+):
     """Create a pooling matrix.
 
     Default behavior after the pool-size sweep update:
@@ -66,12 +72,21 @@ def make_pooling_matrix(n: int, pool_size: int = 10, gaps: tuple = (1,), allow_i
         raise ValueError("pool_size must be positive")
     if (not allow_incomplete_last_pool) and (n % pool_size != 0):
         raise ValueError(f"n={n} must be divisible by pool_size={pool_size}")
+    if pool_order is None:
+        order = np.arange(n, dtype=int)
+    else:
+        order = np.asarray(pool_order, dtype=int)
+        if len(order) != n:
+            raise ValueError(f"pool_order length must be n={n}, got {len(order)}")
+        if len(np.unique(order)) != n or order.min(initial=0) < 0 or order.max(initial=-1) >= n:
+            raise ValueError("pool_order must be a permutation of 0..n-1")
+
     pools = []
     starts = list(range(0, n, pool_size))
     for gap in gaps:
         gap = int(gap)
         for start in starts:
-            pool = tuple(i for i in (start + gap * t for t in range(pool_size)) if 0 <= i < n)
+            pool = tuple(int(order[i]) for i in (start + gap * t for t in range(pool_size)) if 0 <= i < n)
             if pool:
                 pools.append(pool)
     A = np.zeros((len(pools), n), dtype=float)

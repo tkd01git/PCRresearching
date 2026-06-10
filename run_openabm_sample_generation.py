@@ -29,6 +29,7 @@ from data_poolsizefitting import (
     convert_raw_openabm_to_population_contacts,
     export_graph_samples,
     _sample_company_workplace_once,
+    _positive_component_diagnostics,
 )
 from run_poolsize_experiment import parse_int_list
 
@@ -189,19 +190,53 @@ def prepare_seed_sample(args: argparse.Namespace, repo_dir: Path, seed: int) -> 
         population_all = pd.read_csv(population_csv)
         contacts_all = pd.read_csv(contacts_csv)
     else:
+        contact_start_day = int(args.contact_start_day if args.contact_start_day is not None else args.end_time - args.contact_window)
+        contact_end_day = int(args.contact_end_day if args.contact_end_day is not None else args.end_time - 1)
+        if contact_start_day > contact_end_day:
+            raise ValueError(f"contact_start_day={contact_start_day} must be <= contact_end_day={contact_end_day}")
+
+        target_raw_dir = raw_dir / f"end_time_{int(args.end_time)}"
         run_openabm_for_seed(
             repo_dir=repo_dir,
             seed=seed,
-            raw_output_dir=raw_dir,
+            raw_output_dir=target_raw_dir,
             end_time=args.end_time,
             n_total=args.n_total,
         )
-        population_all, contacts_all = convert_raw_openabm_to_population_contacts(
-            output_dir=raw_dir,
+        population_all, target_contacts = convert_raw_openabm_to_population_contacts(
+            output_dir=target_raw_dir,
             target_day=args.end_time,
             contact_window=args.contact_window,
+            contact_start_day=contact_end_day,
+            contact_end_day=contact_end_day,
             random_seed=seed,
         )
+        contact_parts = []
+        if len(target_contacts):
+            contact_parts.append(target_contacts)
+        for contact_day in range(contact_start_day, contact_end_day):
+            # OpenABM's interaction export is the final contact snapshot; an
+            # end_time of contact_day + 1 yields contact_day interactions.
+            contact_raw_dir = raw_dir / f"end_time_{contact_day + 1}"
+            run_openabm_for_seed(
+                repo_dir=repo_dir,
+                seed=seed,
+                raw_output_dir=contact_raw_dir,
+                end_time=contact_day + 1,
+                n_total=args.n_total,
+            )
+            _, day_contacts = convert_raw_openabm_to_population_contacts(
+                output_dir=contact_raw_dir,
+                target_day=contact_day,
+                contact_window=1,
+                contact_start_day=contact_day,
+                contact_end_day=contact_day,
+                random_seed=seed,
+            )
+            if len(day_contacts):
+                contact_parts.append(day_contacts)
+        contacts_all = pd.concat(contact_parts, ignore_index=True) if contact_parts else target_contacts.iloc[0:0].copy()
+        contacts_all = contacts_all.drop_duplicates(["day", "person_i", "person_j", "contact_type"]).reset_index(drop=True)
         seed_root.mkdir(parents=True, exist_ok=True)
         population_all.to_csv(population_csv, index=False)
         contacts_all.to_csv(contacts_csv, index=False)
@@ -255,6 +290,9 @@ def sample_conditions_met(args: argparse.Namespace, diag: dict) -> bool:
     return (
         diag["positive_rate"] <= float(args.max_positive_rate) + 1e-12
         and diag["positive_count"] >= int(args.min_positive_count)
+        and diag["positive_count"] >= int(args.target_positive_count_min)
+        and diag["positive_count"] <= int(args.target_positive_count_max)
+        and diag["contact_edges"] >= int(args.min_contact_edges)
         and diag["positive_component_count"] >= int(args.min_positive_components)
         and diag["isolated_positive_count"] >= int(args.min_isolated_positive)
         and diag["largest_positive_component_ratio"] <= float(args.max_largest_positive_component_ratio)
@@ -269,6 +307,9 @@ def export_nonoverlapping_samples(
     seed_root: Path,
     seed: int,
 ) -> pd.DataFrame:
+    if args.fast_workplace_nonoverlap:
+        return export_nonoverlapping_samples_fast(args, population_all, contacts_all, seed_root, seed)
+
     samples_dir = seed_root / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
@@ -318,6 +359,7 @@ def export_nonoverlapping_samples(
             )
             ok = sample_conditions_met(args, diag)
             score = 0
+            score += min(diag["contact_edges"], int(args.min_contact_edges)) // 100
             score += min(diag["positive_component_count"], int(args.min_positive_components)) * 10
             score += min(diag["isolated_positive_count"], int(args.min_isolated_positive)) * 10
             score += int(100 * min(diag["positive_neighbor_ratio"], float(args.min_positive_neighbor_ratio)))
@@ -353,13 +395,303 @@ def export_nonoverlapping_samples(
             "sampling_conditions_met": bool(conditions_met),
             "target_age_groups": ";".join(map(str, args.target_age_groups)),
             "workplace_contact_types": ";".join(map(str, args.workplace_contact_types)),
+            "target_day": int(args.end_time),
+            "contact_start_day": int(args.contact_start_day if args.contact_start_day is not None else args.end_time - args.contact_window),
+            "contact_end_day": int(args.contact_end_day if args.contact_end_day is not None else args.end_time - 1),
             "max_positive_rate_condition": float(args.max_positive_rate),
             "min_positive_count_condition": int(args.min_positive_count),
+            "min_contact_edges_condition": int(args.min_contact_edges),
             "nonoverlap_person_count_so_far": int(len(used_person_ids)),
         })
         pd.DataFrame([row]).to_csv(sample_dir / "sample_summary.csv", index=False)
         rows.append(row)
         print(f"seed={seed} sample={sample_index}: exported non-overlapping sample to {sample_dir}")
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(seed_root / "generation_summary.csv", index=False)
+    return summary
+
+
+def _connected_components_from_adj_local(adj: dict[int, set[int]], nodes: set[int] | None = None) -> list[list[int]]:
+    if nodes is None:
+        nodes = set(adj.keys())
+    nodes = set(int(x) for x in nodes)
+    seen = set()
+    comps = []
+    for seed in nodes:
+        if seed in seen:
+            continue
+        stack = [seed]
+        seen.add(seed)
+        comp = []
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj.get(u, set()):
+                if v in nodes and v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        comps.append(comp)
+    return comps
+
+
+def _build_workplace_graph(
+    population_all: pd.DataFrame,
+    contacts_all: pd.DataFrame,
+    target_age_groups: list[int],
+    workplace_contact_types: list[int],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, int], dict[int, set[int]], dict[int, int], list[list[int]]]:
+    pop = population_all.copy()
+    pop["person_id"] = pop["person_id"].astype(int)
+    pop["age_group"] = pop["age_group"].astype(int)
+    pop["y_true"] = pop["y_true"].astype(int)
+    pop = pop[pop["age_group"].isin([int(x) for x in target_age_groups])].copy()
+    allowed_ids = set(pop["person_id"].astype(int).tolist())
+
+    con = contacts_all.copy()
+    con["person_i"] = con["person_i"].astype(int)
+    con["person_j"] = con["person_j"].astype(int)
+    con["contact_type"] = con["contact_type"].astype(int)
+    con = con[
+        con["contact_type"].isin([int(x) for x in workplace_contact_types])
+        & con["person_i"].isin(allowed_ids)
+        & con["person_j"].isin(allowed_ids)
+    ].copy()
+
+    y_map = dict(zip(pop["person_id"].astype(int), pop["y_true"].astype(int)))
+    adj: dict[int, set[int]] = {}
+    degree: dict[int, int] = {}
+    pp_adj: dict[int, set[int]] = {}
+    for a, b in zip(con["person_i"], con["person_j"]):
+        ia, ib = int(a), int(b)
+        if ia == ib:
+            continue
+        adj.setdefault(ia, set()).add(ib)
+        adj.setdefault(ib, set()).add(ia)
+        degree[ia] = degree.get(ia, 0) + 1
+        degree[ib] = degree.get(ib, 0) + 1
+        if int(y_map.get(ia, 0)) == 1 and int(y_map.get(ib, 0)) == 1:
+            pp_adj.setdefault(ia, set()).add(ib)
+            pp_adj.setdefault(ib, set()).add(ia)
+
+    pp_comps = [c for c in _connected_components_from_adj_local(pp_adj, set(pp_adj.keys())) if len(c) >= 2]
+    pp_comps.sort(key=len, reverse=True)
+    return pop, con, y_map, adj, degree, pp_comps
+
+
+def _choose_seed_positive_ids(
+    pp_comps: list[list[int]],
+    used_person_ids: set[int],
+    min_positive_count: int,
+    target_positive_count_max: int,
+    min_positive_components: int,
+    max_largest_positive_component_ratio: float,
+) -> set[int]:
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    selected_component_count = 0
+    largest_allowed = max(2, int(np.floor(int(target_positive_count_max) * float(max_largest_positive_component_ratio))))
+    for comp in pp_comps:
+        rem = [int(p) for p in comp if int(p) not in used_person_ids and int(p) not in selected_set]
+        if len(rem) < 2:
+            continue
+        if len(rem) > largest_allowed:
+            continue
+        if len(selected) + len(rem) <= int(target_positive_count_max):
+            selected.extend(rem)
+            selected_set.update(rem)
+            selected_component_count += 1
+        elif len(selected) < int(min_positive_count):
+            take = max(2, min(len(rem), int(target_positive_count_max) - len(selected)))
+            selected.extend(rem[:take])
+            selected_set.update(rem[:take])
+            selected_component_count += 1
+        if (
+            len(selected) >= int(min_positive_count)
+            and selected_component_count >= int(min_positive_components)
+        ):
+            break
+    if selected_component_count < int(min_positive_components):
+        return set()
+    return set(selected)
+
+
+def _expand_workplace_sample_fast(
+    seed_positive_ids: set[int],
+    used_person_ids: set[int],
+    y_map: dict[int, int],
+    adj: dict[int, set[int]],
+    degree: dict[int, int],
+    sample_size: int,
+    max_positive_count: int,
+    rng: np.random.Generator,
+) -> tuple[set[int], dict]:
+    selected = set(int(x) for x in seed_positive_ids)
+    positive_count = sum(1 for x in selected if int(y_map.get(int(x), 0)) == 1)
+    frontier = set(selected)
+    rounds = 0
+    while len(selected) < int(sample_size) and frontier:
+        rounds += 1
+        candidates = set()
+        for u in frontier:
+            candidates.update(
+                v for v in adj.get(int(u), set())
+                if int(v) not in used_person_ids and int(v) not in selected
+            )
+        if not candidates:
+            break
+        neg = [int(x) for x in candidates if int(y_map.get(int(x), 0)) == 0]
+        rng.shuffle(neg)
+        neg = sorted(neg, key=lambda x: degree.get(x, 0), reverse=True)
+        added = []
+        for pid in neg:
+            if len(selected) >= int(sample_size):
+                break
+            selected.add(pid)
+            added.append(pid)
+        frontier = set(added)
+
+    diagnostics = {
+        "workplace_snowball_rounds": int(rounds),
+        "workplace_seed_positive_count": int(len(seed_positive_ids)),
+        "workplace_reachable_sample_size": int(len(selected)),
+    }
+    return set(list(selected)[:int(sample_size)]), diagnostics
+
+
+def export_nonoverlapping_samples_fast(
+    args: argparse.Namespace,
+    population_all: pd.DataFrame,
+    contacts_all: pd.DataFrame,
+    seed_root: Path,
+    seed: int,
+) -> pd.DataFrame:
+    samples_dir = seed_root / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    pop, con, y_map, adj, degree, pp_comps = _build_workplace_graph(
+        population_all=population_all,
+        contacts_all=contacts_all,
+        target_age_groups=args.target_age_groups,
+        workplace_contact_types=args.workplace_contact_types,
+    )
+    print(
+        f"seed={seed}: fast graph eligible_people={len(pop)} "
+        f"workplace_edges={len(con)} positive_components_ge2={len(pp_comps)}"
+    )
+
+    used_person_ids: set[int] = set()
+    used_edges: set[tuple[int, int, int, int]] = set()
+    rows = []
+    rng = np.random.default_rng(int(seed) * 100_000 + 17)
+    max_positive_count = min(int(args.target_positive_count_max), int(np.floor(args.sample_size * args.max_positive_rate)))
+
+    for sample_index in range(1, int(args.samples_per_seed) + 1):
+        sample_name = args.multi_sample_name.format(n=args.sample_size, sample_index=sample_index)
+        sample_dir = samples_dir / sample_name
+        accepted = None
+        for attempt in range(1, int(args.max_sample_attempts) + 1):
+            seed_positive_ids = _choose_seed_positive_ids(
+                pp_comps=pp_comps,
+                used_person_ids=used_person_ids,
+                min_positive_count=args.target_positive_count_min,
+                target_positive_count_max=max_positive_count,
+                min_positive_components=args.min_positive_components,
+                max_largest_positive_component_ratio=args.max_largest_positive_component_ratio,
+            )
+            if len(seed_positive_ids) < int(args.min_positive_count):
+                break
+            selected_ids, snowball_diag = _expand_workplace_sample_fast(
+                seed_positive_ids=seed_positive_ids,
+                used_person_ids=used_person_ids,
+                y_map=y_map,
+                adj=adj,
+                degree=degree,
+                sample_size=args.sample_size,
+                max_positive_count=max_positive_count,
+                rng=rng,
+            )
+            if len(selected_ids) < int(args.sample_size):
+                break
+
+            sample = pop[pop["person_id"].isin(selected_ids)].copy()
+            sample["sample_source"] = np.where(
+                sample["person_id"].isin(seed_positive_ids),
+                "selected_positive",
+                "workplace_neighbor",
+            )
+            sample = sample.sample(frac=1, random_state=int(rng.integers(1_000_000_000))).reset_index(drop=True)
+            sample_con = con[
+                con["person_i"].isin(selected_ids) & con["person_j"].isin(selected_ids)
+            ].copy().reset_index(drop=True)
+            diag, by_person = _positive_component_diagnostics(sample, sample_con)
+            diag.update({
+                "sample_size": int(len(sample)),
+                "positive_count": int(sample["y_true"].astype(int).sum()),
+                "positive_rate": float(sample["y_true"].astype(int).mean()),
+                "contact_edges": int(len(sample_con)),
+                "mean_degree_3day": float(2 * len(sample_con) / max(len(sample), 1)),
+                "mean_degree_per_day": float(2 * len(sample_con) / max(len(sample), 1) / max(sample_con["day"].nunique() if "day" in sample_con.columns else 1, 1)),
+                "contact_days": ";".join(map(str, sorted(sample_con["day"].astype(int).unique().tolist()))) if "day" in sample_con.columns and len(sample_con) else "",
+                "contact_types": ";".join(map(str, sorted(sample_con["contact_type"].astype(str).unique().tolist()))) if len(sample_con) else "",
+                "age_groups": ";".join(map(str, sorted(sample["age_group"].astype(int).unique().tolist()))),
+            })
+            diag.update(snowball_diag)
+            if sample_conditions_met(args, diag):
+                accepted = (sample, sample_con, diag, by_person, attempt)
+                break
+            # Reject this positive seed set permanently for this extraction pass;
+            # otherwise a too-sparse component can be retried forever.
+            used_person_ids.update(seed_positive_ids)
+
+        if accepted is None:
+            raise RuntimeError(
+                f"seed={seed} sample={sample_index}: fast extractor could not make "
+                f"a non-overlapping sample after {args.max_sample_attempts} attempts"
+            )
+
+        sample, sample_con, diag, by_person, attempts_used = accepted
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        sample.to_csv(sample_dir / "population.csv", index=False)
+        sample_con.to_csv(sample_dir / "contacts.csv", index=False)
+        by_person.to_csv(sample_dir / "positive_neighbor_by_positive_person.csv", index=False)
+
+        sample_ids = set(sample["person_id"].astype(int).tolist())
+        edge_keys = set(
+            (int(row.day), int(min(row.person_i, row.person_j)), int(max(row.person_i, row.person_j)), int(row.contact_type))
+            for row in sample_con.itertuples(index=False)
+        )
+        if sample_ids & used_person_ids:
+            raise RuntimeError(f"seed={seed} sample={sample_index}: internal node-overlap check failed")
+        if edge_keys & used_edges:
+            raise RuntimeError(f"seed={seed} sample={sample_index}: internal edge-overlap check failed")
+        used_person_ids.update(sample_ids)
+        used_edges.update(edge_keys)
+
+        row = dict(diag)
+        row.update({
+            "seed": int(seed),
+            "sample_index": int(sample_index),
+            "path": str(sample_dir),
+            "attempts_used": int(attempts_used),
+            "sampling_conditions_met": True,
+            "target_age_groups": ";".join(map(str, args.target_age_groups)),
+            "workplace_contact_types": ";".join(map(str, args.workplace_contact_types)),
+            "target_day": int(args.end_time),
+            "contact_start_day": int(args.contact_start_day if args.contact_start_day is not None else args.end_time - args.contact_window),
+            "contact_end_day": int(args.contact_end_day if args.contact_end_day is not None else args.end_time - 1),
+            "max_positive_rate_condition": float(args.max_positive_rate),
+            "min_positive_count_condition": int(args.min_positive_count),
+            "min_contact_edges_condition": int(args.min_contact_edges),
+            "nonoverlap_person_count_so_far": int(len(used_person_ids)),
+            "nonoverlap_edge_count_so_far": int(len(used_edges)),
+            "fast_workplace_nonoverlap": True,
+        })
+        pd.DataFrame([row]).to_csv(sample_dir / "sample_summary.csv", index=False)
+        rows.append(row)
+        print(
+            f"seed={seed} sample={sample_index}: exported fast non-overlapping sample "
+            f"contacts={row['contact_edges']} positives={row['positive_count']} to {sample_dir}"
+        )
 
     summary = pd.DataFrame(rows)
     summary.to_csv(seed_root / "generation_summary.csv", index=False)
@@ -381,7 +713,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-sample-name", default="company_n{n}_sample{sample_index:02d}_maxpos5pct_work")
     parser.add_argument("--max-sample-attempts", type=int, default=300)
     parser.add_argument("--end-time", type=int, default=40)
-    parser.add_argument("--contact-window", type=int, default=7)
+    parser.add_argument("--contact-window", type=int, default=3, help="Fallback number of previous days for contact graph when explicit bounds are not set.")
+    parser.add_argument("--contact-start-day", type=int, default=37, help="First OpenABM day included in the contact graph.")
+    parser.add_argument("--contact-end-day", type=int, default=39, help="Last OpenABM day included in the contact graph.")
     parser.add_argument("--n-total", type=int, default=None, help="Best-effort population override when supported by OpenABM parameters.")
     parser.add_argument("--skip-build", action="store_true", help="Use an existing OpenABM executable without running make.")
     parser.add_argument("--reuse-converted", action="store_true", help="Reuse population_all.csv and contacts_all.csv if present.")
@@ -389,10 +723,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delete-raw-after-convert", action="store_true", help="Delete raw OpenABM output after converted/sample CSVs are saved.")
     parser.add_argument("--allow-best-effort-samples", dest="require_sampling_conditions", action="store_false", help="Save the best sample even if diagnostics do not meet all thresholds.")
     parser.set_defaults(require_sampling_conditions=True)
+    parser.add_argument("--fast-workplace-nonoverlap", action="store_true", default=True, help="Build the workplace graph once and export non-overlapping workplace-neighborhood samples quickly.")
+    parser.add_argument("--no-fast-workplace-nonoverlap", dest="fast_workplace_nonoverlap", action="store_false")
     parser.add_argument("--target-age-groups", nargs="+", type=int, default=[2, 3, 4, 5])
     parser.add_argument("--workplace-contact-types", nargs="+", type=int, default=[1])
     parser.add_argument("--max-positive-rate", type=float, default=0.05)
     parser.add_argument("--min-positive-count", type=int, default=30)
+    parser.add_argument("--min-contact-edges", type=int, default=10000)
     parser.add_argument("--target-positive-count-min", type=int, default=50)
     parser.add_argument("--target-positive-count-max", type=int, default=120)
     parser.add_argument("--min-positive-components", type=int, default=3)

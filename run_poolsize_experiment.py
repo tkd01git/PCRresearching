@@ -141,6 +141,7 @@ def run_one_seed_poolsize(args, population, contacts, seed: int, pool_size: int,
         noncovid_base_prob=args.noncovid_base_prob,
         pos_noncovid_prob=args.pos_noncovid_prob,
         target_positive_symptomatic_rate=args.target_positive_symptomatic_rate,
+        pool_assignment_seed=getattr(args, "pool_assignment_seed", None),
     )
 
     analysis_dataset = (

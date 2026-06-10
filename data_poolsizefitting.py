@@ -256,7 +256,14 @@ def _find_first(output_dir: Path, names: list[str]):
     return hits[0] if hits else None
 
 
-def convert_raw_openabm_to_population_contacts(output_dir="/content/openabm_real_output", target_day=40, contact_window=7, random_seed=472):
+def convert_raw_openabm_to_population_contacts(
+    output_dir="/content/openabm_real_output",
+    target_day=40,
+    contact_window=3,
+    random_seed=472,
+    contact_start_day=None,
+    contact_end_day=None,
+):
     output_dir = Path(output_dir)
     individual_path = _find_first(output_dir, ["individual_file_Run1.csv", "individual_Run1.csv", "*individual*Run1*.csv"])
     interactions_path = _find_first(output_dir, ["interactions_Run1.csv", "*interaction*Run1*.csv"])
@@ -289,11 +296,25 @@ def convert_raw_openabm_to_population_contacts(output_dir="/content/openabm_real
         i_col, j_col = "person_i", "person_j"
     else:
         raise ValueError(f"contact id columns not found: {inter.columns.tolist()}")
+    if contact_start_day is None:
+        contact_start_day = int(target_day) - int(contact_window)
+    if contact_end_day is None:
+        contact_end_day = int(target_day) - 1
+    contact_start_day = int(contact_start_day)
+    contact_end_day = int(contact_end_day)
+    if contact_start_day > contact_end_day:
+        raise ValueError(
+            f"contact_start_day={contact_start_day} must be <= contact_end_day={contact_end_day}"
+        )
+
     if "time" in inter.columns:
         inter["contact_day"] = pd.to_numeric(inter["time"], errors="coerce").fillna(target_day).astype(int)
-        inter = inter[(inter["contact_day"] >= target_day - contact_window) & (inter["contact_day"] <= target_day)].copy()
+        inter = inter[
+            (inter["contact_day"] >= contact_start_day)
+            & (inter["contact_day"] <= contact_end_day)
+        ].copy()
     else:
-        inter["contact_day"] = target_day
+        inter["contact_day"] = contact_end_day
     con = pd.DataFrame({
         "day": inter["contact_day"].astype(int),
         "person_i": inter[i_col].astype(int),
@@ -1264,6 +1285,7 @@ def build_analysis_dataset(
     noncovid_base_prob=0.10,
     pos_noncovid_prob=0.10,
     target_positive_symptomatic_rate=0.75,
+    pool_assignment_seed=None,
 ):
     import function_poolsizefittiing as fn
     pop = population.copy().reset_index(drop=True)
@@ -1291,7 +1313,16 @@ def build_analysis_dataset(
     n = len(pop)
     # Pool-size sweep uses pool_size=1..30. If n is not divisible by pool_size,
     # the last pool is allowed to be smaller.
-    A, pools = fn.make_pooling_matrix(n, pool_size=pool_size, gaps=params["gaps"], allow_incomplete_last_pool=True)
+    pool_order = None
+    if pool_assignment_seed is not None:
+        pool_order = np.random.default_rng(int(pool_assignment_seed)).permutation(n)
+    A, pools = fn.make_pooling_matrix(
+        n,
+        pool_size=pool_size,
+        gaps=params["gaps"],
+        allow_incomplete_last_pool=True,
+        pool_order=pool_order,
+    )
     pooled_amount_true, pooled_ct, pooled_amount_est = fn.pooled_measurements_qpcr(A, x_true, params)
     symptom_cols = [c for c in pop.columns if c.startswith("reported_symptom_")]
     symptom_mat = pop[symptom_cols].to_numpy(dtype=int)
@@ -1315,6 +1346,7 @@ def build_analysis_dataset(
         "pooled_amount_true": pooled_amount_true,
         "pooled_ct": pooled_ct,
         "pooled_amount_est": pooled_amount_est,
+        "pool_assignment_seed": pool_assignment_seed,
     }
 
 
@@ -1613,6 +1645,7 @@ def _sample_company_workplace_once(
         "positive_count": int(sample["y_true"].astype(int).sum()),
         "positive_rate": float(sample["y_true"].astype(int).mean()),
         "contact_edges": int(len(sample_con)),
+        "contact_days": ";".join(map(str, sorted(sample_con["day"].astype(int).unique().tolist()))) if "day" in sample_con.columns and len(sample_con) else "",
         "contact_types": ";".join(map(str, sorted(sample_con["contact_type"].astype(str).unique().tolist()))) if len(sample_con) else "",
         "age_groups": ";".join(map(str, sorted(sample["age_group"].astype(int).unique().tolist()))),
     })
@@ -1943,6 +1976,81 @@ def _select_positive_ids_with_clusters(pos_pool, con, k_pos, rng, min_positive_n
 
     return set(int(x) for x in selected[:k_pos])
 
+
+def _snowball_workplace_sample_ids(
+    con: pd.DataFrame,
+    y_map: dict[int, int],
+    seed_positive_ids: set[int],
+    n: int,
+    max_positive_count: int,
+    rng: np.random.Generator,
+) -> tuple[set[int], dict]:
+    """Expand a sample from positive workplace clusters through work contacts."""
+    adj: dict[int, set[int]] = defaultdict(set)
+    degree = defaultdict(int)
+    for a, b in zip(con["person_i"].astype(int), con["person_j"].astype(int)):
+        ia, ib = int(a), int(b)
+        if ia == ib:
+            continue
+        adj[ia].add(ib)
+        adj[ib].add(ia)
+        degree[ia] += 1
+        degree[ib] += 1
+
+    selected = set(int(x) for x in seed_positive_ids)
+    positive_count = sum(1 for x in selected if int(y_map.get(int(x), 0)) == 1)
+    frontier = set(selected)
+    rounds = 0
+
+    while len(selected) < int(n) and frontier:
+        rounds += 1
+        candidates = set()
+        for u in frontier:
+            candidates.update(v for v in adj.get(int(u), set()) if v not in selected)
+        if not candidates:
+            break
+
+        neg = [int(x) for x in candidates if int(y_map.get(int(x), 0)) == 0]
+        pos = [int(x) for x in candidates if int(y_map.get(int(x), 0)) == 1]
+        rng.shuffle(neg)
+        rng.shuffle(pos)
+        neg = sorted(neg, key=lambda x: degree.get(x, 0), reverse=True)
+        pos = sorted(pos, key=lambda x: degree.get(x, 0), reverse=True)
+
+        added = []
+        for pid in neg:
+            if len(selected) >= int(n):
+                break
+            selected.add(pid)
+            added.append(pid)
+        for pid in pos:
+            if len(selected) >= int(n) or positive_count >= int(max_positive_count):
+                break
+            selected.add(pid)
+            positive_count += 1
+            added.append(pid)
+        frontier = set(added)
+
+    if len(selected) < int(n):
+        remaining_neg = [
+            int(pid) for pid, y in y_map.items()
+            if int(y) == 0 and int(pid) not in selected and int(pid) in adj
+        ]
+        rng.shuffle(remaining_neg)
+        remaining_neg = sorted(remaining_neg, key=lambda x: degree.get(x, 0), reverse=True)
+        for pid in remaining_neg:
+            if len(selected) >= int(n):
+                break
+            selected.add(pid)
+
+    diagnostics = {
+        "workplace_snowball_rounds": int(rounds),
+        "workplace_seed_positive_count": int(len(seed_positive_ids)),
+        "workplace_reachable_sample_size": int(len(selected)),
+    }
+    return set(list(selected)[:int(n)]), diagnostics
+
+
 def _sample_company_workplace_once(
     population_all: pd.DataFrame,
     contacts_all: pd.DataFrame,
@@ -1991,12 +2099,20 @@ def _sample_company_workplace_once(
         min_positive_neighbor_ratio=1.0,
         min_isolated_positive=0,
     )
-    neg_needed = n - len(pos_selected)
-    neg_selected = set(rng.choice(neg_pool, size=neg_needed, replace=False).astype(int).tolist())
-    selected = pos_selected | neg_selected
+    y_map = dict(zip(eligible["person_id"].astype(int), eligible["y_true"].astype(int)))
+    selected, snowball_diag = _snowball_workplace_sample_ids(
+        con=con,
+        y_map=y_map,
+        seed_positive_ids=pos_selected,
+        n=int(n),
+        max_positive_count=int(np.floor(n * max_positive_rate)),
+        rng=rng,
+    )
+    if len(selected) < n:
+        raise ValueError(f"Not enough workplace-neighborhood people: selected={len(selected)}, n={n}")
 
     sample = pop[pop["person_id"].isin(selected)].copy()
-    sample["sample_source"] = np.where(sample["person_id"].isin(pos_selected), "selected_positive", "selected_negative")
+    sample["sample_source"] = np.where(sample["person_id"].isin(pos_selected), "selected_positive", "workplace_neighbor")
     sample = sample.sample(frac=1, random_state=int(rng.integers(1_000_000_000))).reset_index(drop=True)
     ids = set(sample["person_id"].astype(int).tolist())
     sample_con = con[con["person_i"].isin(ids) & con["person_j"].isin(ids)].copy().reset_index(drop=True)
@@ -2006,7 +2122,11 @@ def _sample_company_workplace_once(
         "positive_count": int(sample["y_true"].astype(int).sum()),
         "positive_rate": float(sample["y_true"].astype(int).mean()),
         "contact_edges": int(len(sample_con)),
+        "mean_degree_3day": float(2 * len(sample_con) / max(len(sample), 1)),
+        "mean_degree_per_day": float(2 * len(sample_con) / max(len(sample), 1) / max(sample_con["day"].nunique() if "day" in sample_con.columns else 1, 1)),
+        "contact_days": ";".join(map(str, sorted(sample_con["day"].astype(int).unique().tolist()))) if "day" in sample_con.columns and len(sample_con) else "",
         "contact_types": ";".join(map(str, sorted(sample_con["contact_type"].astype(str).unique().tolist()))) if len(sample_con) else "",
         "age_groups": ";".join(map(str, sorted(sample["age_group"].astype(int).unique().tolist()))),
     })
+    diag.update(snowball_diag)
     return sample, sample_con, diag, by_person

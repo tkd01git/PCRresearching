@@ -20,3 +20,9 @@ company_openabm_outputs/
 
 # Small OpenABM smoke-test samples; keep standard n3000 samples commit-ready.
 openabm_sample_outputs/**/samples/company_n300_maxpos5pct_work/
+
+# Local probe/final staging directories used before copying commit-ready samples
+# into openabm_sample_outputs/.
+openabm_sample_outputs_day37_39_probe/
+openabm_sample_outputs_workplace_probe/
+openabm_sample_outputs_workplace_final/
